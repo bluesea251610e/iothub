@@ -202,6 +202,22 @@ func (c *Client) RegisterMethod(ctx context.Context, name string, fn DirectMetho
 	return c.dmMux.handle(name, fn)
 }
 
+// SetDefaultMethodHandler sets a default handler for unregistered direct methods.
+// The method name is passed in the payload as "$methodName".
+// This is useful for catching all methods in a single handler (like C SDK's command callback).
+func (c *Client) SetDefaultMethodHandler(ctx context.Context, fn DirectMethodHandler) error {
+	if err := c.checkConnection(ctx); err != nil {
+		return err
+	}
+	if err := c.dmMux.once(func() error {
+		return c.tr.RegisterDirectMethods(ctx, c.dmMux)
+	}); err != nil {
+		return err
+	}
+	c.dmMux.setDefault(fn)
+	return nil
+}
+
 // UnregisterMethod unregisters the named method.
 func (c *Client) UnregisterMethod(name string) {
 	c.dmMux.remove(name)
@@ -335,6 +351,24 @@ func WithSendCreationTime(t time.Time) SendOption {
 	}
 }
 
+// WithSendContentType sets the content type of the message (e.g., "application/json").
+// This is used for message routing in IoT Hub.
+func WithSendContentType(contentType string) SendOption {
+	return func(msg *common.Message) error {
+		msg.ContentType = contentType
+		return nil
+	}
+}
+
+// WithSendContentEncoding sets the content encoding of the message (e.g., "utf-8").
+// This is used for message routing in IoT Hub.
+func WithSendContentEncoding(contentEncoding string) SendOption {
+	return func(msg *common.Message) error {
+		msg.ContentEncoding = contentEncoding
+		return nil
+	}
+}
+
 // SendEvent sends a device-to-cloud message.
 // Panics when event is nil.
 func (c *Client) SendEvent(ctx context.Context, payload []byte, opts ...SendOption) error {
@@ -351,6 +385,31 @@ func (c *Client) SendEvent(ctx context.Context, payload []byte, opts ...SendOpti
 		return err
 	}
 	c.logger.Debugf("device-to-cloud: %#v", msg)
+	return nil
+}
+
+// SendEventToOutput sends a device-to-cloud message to a specific output.
+// This is used by Edge modules to route messages to downstream modules.
+// The outputName corresponds to the output defined in the Edge module's route configuration.
+func (c *Client) SendEventToOutput(ctx context.Context, outputName string, payload []byte, opts ...SendOption) error {
+	if err := c.checkConnection(ctx); err != nil {
+		return err
+	}
+	msg := &common.Message{Payload: payload}
+	for _, opt := range opts {
+		if err := opt(msg); err != nil {
+			return err
+		}
+	}
+	// Store output name in TransportOptions for transport layer to use
+	if msg.TransportOptions == nil {
+		msg.TransportOptions = make(map[string]interface{})
+	}
+	msg.TransportOptions["output"] = outputName
+	if err := c.tr.Send(ctx, msg); err != nil {
+		return err
+	}
+	c.logger.Debugf("device-to-cloud (output=%s): %#v", outputName, msg)
 	return nil
 }
 
