@@ -66,6 +66,38 @@ func WithModelID(modelID string) TransportOption {
 	}
 }
 
+// WithConnectionStatusHandler sets a callback that is invoked when the connection
+// status changes (connected/disconnected). This is useful for monitoring connection health.
+func WithConnectionStatusHandler(handler ConnectionStatusHandler) TransportOption {
+	return func(tr *Transport) {
+		tr.connStatusHandler = handler
+	}
+}
+
+// WithRetryInterval sets the maximum reconnect interval.
+// Default is 30 seconds.
+func WithRetryInterval(interval time.Duration) TransportOption {
+	return func(tr *Transport) {
+		tr.retryInterval = interval
+	}
+}
+
+// WithKeepAlive sets the keep alive interval.
+// Default is 60 seconds.
+func WithKeepAlive(keepAlive time.Duration) TransportOption {
+	return func(tr *Transport) {
+		tr.keepAlive = keepAlive
+	}
+}
+
+// WithTokenLifetime sets the SAS token lifetime.
+// Default is 1 hour.
+func WithTokenLifetime(lifetime time.Duration) TransportOption {
+	return func(tr *Transport) {
+		tr.tokenLifetime = lifetime
+	}
+}
+
 // New returns new Transport transport.
 // See more: https://docs.microsoft.com/en-us/azure/iot-hub/iot-hub-mqtt-support
 func New(opts ...TransportOption) *Transport {
@@ -77,6 +109,11 @@ func New(opts ...TransportOption) *Transport {
 	}
 	return tr
 }
+
+// ConnectionStatusHandler handles connection status changes.
+// connected: true if connected, false if disconnected
+// err: error if disconnected due to error, nil otherwise
+type ConnectionStatusHandler func(connected bool, err error)
 
 type Transport struct {
 	mu   sync.RWMutex
@@ -95,7 +132,11 @@ type Transport struct {
 	logger logger.Logger
 	cocfg  func(opts *mqtt.ClientOptions)
 
-	webSocket bool
+	webSocket         bool
+	connStatusHandler ConnectionStatusHandler // connection status callback
+	retryInterval     time.Duration           // reconnect interval (default: 30s)
+	keepAlive         time.Duration           // keep alive interval (default: 60s)
+	tokenLifetime     time.Duration           // SAS token lifetime (default: 1h)
 }
 
 type resp struct {
@@ -124,7 +165,34 @@ func (tr *Transport) Connect(ctx context.Context, creds transport.Credentials) e
 		tlsCfg.Certificates = append(tlsCfg.Certificates, *crt)
 	}
 
-	username := creds.GetHostName() + "/" + creds.GetDeviceID() + "/api-version=2020-09-30"
+	// Determine if this is a module client (IoT Edge)
+	isModule := creds.GetModuleID() != ""
+	isEdgeGateway := creds.UseEdgeGateway()
+
+	// Build username based on device or module
+	var username string
+	var clientID string
+	var brokerHost string
+
+	if isModule {
+		// Module client: {hostname}/{deviceId}/{moduleId}/api-version=2020-09-30
+		username = creds.GetHostName() + "/" + creds.GetDeviceID() + "/" + creds.GetModuleID() + "/api-version=2020-09-30"
+		clientID = creds.GetDeviceID() + "/" + creds.GetModuleID()
+		// Edge module connects to gateway, not IoT Hub directly
+		if isEdgeGateway && creds.GetGateway() != "" {
+			brokerHost = creds.GetGateway()
+			// Edge uses self-signed certs, skip verification
+			tlsCfg.InsecureSkipVerify = true
+		} else {
+			brokerHost = creds.GetHostName()
+		}
+	} else {
+		// Device client: {hostname}/{deviceId}/api-version=2020-09-30
+		username = creds.GetHostName() + "/" + creds.GetDeviceID() + "/api-version=2020-09-30"
+		clientID = creds.GetDeviceID()
+		brokerHost = creds.GetHostName()
+	}
+
 	if tr.mid != "" {
 		username += "&model-id=" + url.QueryEscape(tr.mid)
 	}
@@ -132,19 +200,41 @@ func (tr *Transport) Connect(ctx context.Context, creds transport.Credentials) e
 	o := mqtt.NewClientOptions()
 	o.SetTLSConfig(tlsCfg)
 	if tr.webSocket {
-		o.AddBroker("wss://" + creds.GetHostName() + ":443/$iothub/websocket") // https://github.com/MicrosoftDocs/azure-docs/issues/21306
+		o.AddBroker("wss://" + brokerHost + ":443/$iothub/websocket")
 	} else {
-		o.AddBroker("tls://" + creds.GetHostName() + ":8883")
+		o.AddBroker("tls://" + brokerHost + ":8883")
 	}
 	o.SetProtocolVersion(4) // 4 = MQTT 3.1.1
-	o.SetClientID(creds.GetDeviceID())
+	o.SetClientID(clientID)
 	o.SetCredentialsProvider(func() (string, string) {
 		if crt := creds.GetCertificate(); crt != nil {
 			return username, ""
 		}
-		// TODO: renew token only when it expires in case an external token provider is used
-		// TODO: this can slow down the reconnect feature, so need to figure out max token lifetime
-		sas, err := creds.Token(creds.GetHostName(), time.Hour)
+
+		var sas *common.SharedAccessSignature
+		var err error
+
+		// Use configured token lifetime, default to 1 hour
+		tokenLifetime := tr.tokenLifetime
+		if tokenLifetime == 0 {
+			tokenLifetime = time.Hour
+		}
+
+		if isModule && creds.GetWorkloadURI() != "" {
+			// Module: use Workload API to sign token
+			resource := creds.GetHostName() + "/devices/" + creds.GetDeviceID() + "/modules/" + creds.GetModuleID()
+			sas, err = creds.TokenFromEdge(
+				creds.GetWorkloadURI(),
+				creds.GetModuleID(),
+				creds.GetGenerationID(),
+				resource,
+				tokenLifetime,
+			)
+		} else {
+			// Device: use shared access key
+			sas, err = creds.Token(creds.GetHostName(), tokenLifetime)
+		}
+
 		if err != nil {
 			tr.logger.Errorf("cannot generate token: %s", err)
 			return "", ""
@@ -152,9 +242,24 @@ func (tr *Transport) Connect(ctx context.Context, creds transport.Credentials) e
 		return username, sas.String()
 	})
 	o.SetWriteTimeout(30 * time.Second)
-	o.SetMaxReconnectInterval(30 * time.Second) // default is 15min, way to long
+	// Apply retry interval (default 30s)
+	retryInterval := 30 * time.Second
+	if tr.retryInterval > 0 {
+		retryInterval = tr.retryInterval
+	}
+	o.SetMaxReconnectInterval(retryInterval)
+	// Apply keep alive (default 60s)
+	keepAlive := 60 * time.Second
+	if tr.keepAlive > 0 {
+		keepAlive = tr.keepAlive
+	}
+	o.SetKeepAlive(keepAlive)
 	o.SetOnConnectHandler(func(c mqtt.Client) {
 		tr.logger.Debugf("connection established")
+		// Invoke connection status callback
+		if tr.connStatusHandler != nil {
+			tr.connStatusHandler(true, nil)
+		}
 		tr.subm.RLock()
 		for _, sub := range tr.subs {
 			if err := sub(); err != nil {
@@ -165,6 +270,10 @@ func (tr *Transport) Connect(ctx context.Context, creds transport.Credentials) e
 	})
 	o.SetConnectionLostHandler(func(_ mqtt.Client, err error) {
 		tr.logger.Debugf("connection lost: %v", err)
+		// Invoke connection status callback
+		if tr.connStatusHandler != nil {
+			tr.connStatusHandler(false, err)
+		}
 	})
 
 	if tr.cocfg != nil {
@@ -513,11 +622,28 @@ func (tr *Transport) Send(ctx context.Context, msg *common.Message) error {
 	if msg.EnqueuedTime != nil && !msg.EnqueuedTime.IsZero() {
 		u.Add("$.ctime", msg.EnqueuedTime.UTC().Format(rfc3339Milli))
 	}
+	// Content-Type and Content-Encoding are system properties for message routing
+	// See: https://docs.microsoft.com/en-us/azure/iot-hub/iot-hub-devguide-messages-construct
+	if msg.ContentType != "" {
+		u.Add("$.ct", msg.ContentType)
+	}
+	if msg.ContentEncoding != "" {
+		u.Add("$.ce", msg.ContentEncoding)
+	}
 	for k, v := range msg.Properties {
 		u.Add(k, v)
 	}
 
-	dst := "devices/" + tr.did + "/messages/events/" + encodeProperties(u)
+	// Build the destination topic
+	// For Edge modules with output routing: devices/{deviceId}/modules/{moduleId}/messages/events/{output}/...
+	// For regular devices: devices/{deviceId}/messages/events/...
+	var dst string
+	if output, ok := msg.TransportOptions["output"].(string); ok && output != "" {
+		// Edge module output routing
+		dst = "devices/" + tr.did + "/modules/" + tr.did + "/messages/events/" + output + "/" + encodeProperties(u)
+	} else {
+		dst = "devices/" + tr.did + "/messages/events/" + encodeProperties(u)
+	}
 	qos := DefaultQoS
 	if q, ok := msg.TransportOptions["qos"]; ok {
 		qos = q.(int) // panic if it's not an int
