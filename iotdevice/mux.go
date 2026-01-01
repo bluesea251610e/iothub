@@ -195,13 +195,21 @@ func newMethodMux() *methodMux {
 
 // methodMux is direct-methods dispatcher.
 type methodMux struct {
-	on sync.Once
-	mu sync.RWMutex
-	m  map[string]DirectMethodHandler
+	on       sync.Once
+	mu       sync.RWMutex
+	m        map[string]DirectMethodHandler
+	default_ DirectMethodHandler // default handler for unregistered methods
 }
 
 func (m *methodMux) once(fn func() error) error {
 	return once(&m.on, fn)
+}
+
+// setDefault sets the default handler for unregistered methods.
+func (m *methodMux) setDefault(fn DirectMethodHandler) {
+	m.mu.Lock()
+	m.default_ = fn
+	m.mu.Unlock()
 }
 
 // handle registers the given direct-method handler.
@@ -235,14 +243,25 @@ func (m *methodMux) remove(method string) {
 func (m *methodMux) Dispatch(method string, b []byte) (int, []byte, error) {
 	m.mu.RLock()
 	f, ok := m.m[method]
+	defaultHandler := m.default_
 	m.mu.RUnlock()
+
 	if !ok {
-		return 0, nil, fmt.Errorf("method %q is not registered", method)
+		// Try default handler
+		if defaultHandler != nil {
+			f = defaultHandler
+		} else {
+			return 0, nil, fmt.Errorf("method %q is not registered", method)
+		}
 	}
 
 	var v map[string]interface{}
 	if err := json.Unmarshal(b, &v); err != nil {
 		return jsonErr(err)
+	}
+	// Add method name to payload for default handler
+	if !ok && defaultHandler != nil {
+		v["$methodName"] = method
 	}
 	code, v, err := f(v)
 	if err != nil {
