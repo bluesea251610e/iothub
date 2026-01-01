@@ -27,6 +27,14 @@ type Message struct {
 	// UserID is an ID used to specify the origin of messages.
 	UserID string `json:"UserId,omitempty"`
 
+	// ContentType is the content type of the message payload (e.g., "application/json").
+	// Used for message routing in IoT Hub.
+	ContentType string `json:"ContentType,omitempty"`
+
+	// ContentEncoding is the content encoding of the message payload (e.g., "utf-8", "utf-16", "utf-32").
+	// Used for message routing in IoT Hub.
+	ContentEncoding string `json:"ContentEncoding,omitempty"`
+
 	// ConnectionDeviceID is an ID set by IoT Hub on device-to-cloud messages.
 	// It contains the deviceId of the device that sent the message.
 	ConnectionDeviceID string `json:"ConnectionDeviceId,omitempty"`
