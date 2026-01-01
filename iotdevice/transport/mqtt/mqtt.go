@@ -13,10 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/amenzhinsky/iothub/common"
-	"github.com/amenzhinsky/iothub/iotdevice/transport"
-	"github.com/amenzhinsky/iothub/iotservice"
-	"github.com/amenzhinsky/iothub/logger"
+	"github.com/bluesea251610e/iothub/common"
+	"github.com/bluesea251610e/iothub/iotdevice/transport"
+	"github.com/bluesea251610e/iothub/iotservice"
+	"github.com/bluesea251610e/iothub/logger"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 

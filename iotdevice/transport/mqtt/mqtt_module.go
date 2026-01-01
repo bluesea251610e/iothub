@@ -8,8 +8,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/amenzhinsky/iothub/common"
-	"github.com/amenzhinsky/iothub/iotdevice/transport"
+	"github.com/bluesea251610e/iothub/common"
+	"github.com/bluesea251610e/iothub/iotdevice/transport"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
