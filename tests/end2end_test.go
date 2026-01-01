@@ -13,6 +13,7 @@ import (
 
 	"github.com/bluesea251610e/iothub/iotdevice"
 	"github.com/bluesea251610e/iothub/iotdevice/transport"
+	"github.com/bluesea251610e/iothub/iotdevice/transport/amqp"
 	"github.com/bluesea251610e/iothub/iotdevice/transport/mqtt"
 	"github.com/bluesea251610e/iothub/iotservice"
 )
@@ -67,7 +68,8 @@ func TestEnd2End(t *testing.T) {
 	for name, mktransport := range map[string]func() transport.Transport{
 		"mqtt":    func() transport.Transport { return mqtt.New() },
 		"mqtt-ws": func() transport.Transport { return mqtt.New(mqtt.WithWebSocket(true)) },
-		// TODO: "amqp": func() transport.Transport { return amqp.New() },
+		"amqp":    func() transport.Transport { return amqp.New() },
+		"amqp-ws": func() transport.Transport { return amqp.New(amqp.WithWebSocket(true)) },
 		// TODO: "http": func() transport.Transport { return http.New() },
 	} {
 		mktransport := mktransport
