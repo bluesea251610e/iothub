@@ -1,5 +1,7 @@
 # iothub
 
+fork from https://github.com/amenzhinsky/iothub
+
 Azure IoT Hub SDK for Golang, provides both device-to-cloud ([`iotdevice`](iotdevice)) and cloud-to-device ([`iotservice`](iotservice)) packages for end-to-end communication.
 
 API is subject to change until `v1.0.0`. Bumping minor version may indicate breaking changes.
@@ -86,11 +88,11 @@ func main() {
 }
 ```
 
-[cmd/iothub-service](https://github.com/bluesea251610e/iothub/blob/master/cmd/iothub-service) and [cmd/iothub-device](https://github.com/bluesea251610e/iothub/blob/master/cmd/iothub-device) are reference implementations of almost all available features. 
+[cmd/iothub-service](https://github.com/bluesea251610e/iothub/blob/master/cmd/iothub-service) and [cmd/iothub-device](https://github.com/bluesea251610e/iothub/blob/master/cmd/iothub-device) are reference implementations of almost all available features.
 
 ## CLI
 
-The project provides two command line utilities: `iothub-device` and `iothub-sevice`. First is for using it on IoT devices and the second manages and interacts with them. 
+The project provides two command line utilities: `iothub-device` and `iothub-sevice`. First is for using it on IoT devices and the second manages and interacts with them.
 
 You can perform operations like publishing, subscribing to events and feedback, registering and invoking direct methods and so on straight from the command line.
 
@@ -109,14 +111,14 @@ See `-help` for more details.
 ### iotservice
 
 1. Complete IoT Edge support
-1. Stabilize API
-1. Fix TODOs
+2. Stabilize API
+3. Fix TODOs
 
 ### iotdevice
 
 1. Device modules support.
-1. HTTP transport (files uploading).
-1. AMQP transport (batch sending, WS).
+2. HTTP transport (files uploading).
+3. AMQP transport (batch sending, WS).
 
 ## Contributing
 
