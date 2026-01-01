@@ -15,6 +15,7 @@ import (
 	"github.com/bluesea251610e/iothub/cmd/internal"
 	"github.com/bluesea251610e/iothub/iotdevice"
 	"github.com/bluesea251610e/iothub/iotdevice/transport"
+	amqpTransport "github.com/bluesea251610e/iothub/iotdevice/transport/amqp"
 	"github.com/bluesea251610e/iothub/iotdevice/transport/http"
 	"github.com/bluesea251610e/iothub/iotdevice/transport/mqtt"
 )
@@ -24,7 +25,7 @@ var transports = map[string]func() (transport.Transport, error){
 		return mqtt.New(mqtt.WithWebSocket(wsFlag)), nil
 	},
 	"amqp": func() (transport.Transport, error) {
-		return nil, errors.New("not implemented")
+		return amqpTransport.New(amqpTransport.WithWebSocket(wsFlag)), nil
 	},
 	"http": func() (transport.Transport, error) {
 		return http.New(), nil
@@ -51,7 +52,8 @@ var (
 
 	propsFlag map[string]string
 
-	twinPropsFlag map[string]interface{}
+	twinPropsFlag    map[string]interface{}
+	sendIntervalFlag int // daemon send interval
 )
 
 func main() {
@@ -130,6 +132,14 @@ func run() error {
 			Args:    []string{"FILE"},
 			Desc:    "upload a file using IoT fiel upload",
 			Handler: wrap(ctx, uploadFile),
+		},
+		{
+			Name:    "daemon",
+			Desc:    "run as daemon for manual testing (C2D, methods, twin, periodic D2C)",
+			Handler: wrap(ctx, daemon),
+			ParseFunc: func(f *flag.FlagSet) {
+				f.IntVar(&sendIntervalFlag, "interval", 10, "D2C send interval in seconds (0 to disable)")
+			},
 		},
 	}).Run(os.Args)
 }
@@ -299,6 +309,102 @@ func uploadFile(ctx context.Context, c *iotdevice.Client, args []string) error {
 		return err
 	}
 
+	return nil
+}
+
+// daemon runs continuously, subscribing to C2D, methods, twin updates,
+// and periodically sending D2C messages
+func daemon(ctx context.Context, c *iotdevice.Client, args []string) error {
+	fmt.Println("=== IoT Hub Device Daemon ===")
+	fmt.Printf("Transport: %s (ws=%v)\n", transportFlag, wsFlag)
+	fmt.Printf("D2C interval: %ds\n", sendIntervalFlag)
+	fmt.Println()
+
+	// Subscribe to C2D events
+	evSub, err := c.SubscribeEvents(ctx)
+	if err != nil {
+		return fmt.Errorf("subscribe events: %w", err)
+	}
+	fmt.Println("[C2D] Subscribed to cloud-to-device messages")
+
+	// Subscribe to twin updates
+	twinSub, err := c.SubscribeTwinUpdates(ctx)
+	if err != nil {
+		return fmt.Errorf("subscribe twin: %w", err)
+	}
+	fmt.Println("[TWIN] Subscribed to twin updates")
+
+	// Register a test method
+	if err := c.RegisterMethod(ctx, "testMethod", func(p map[string]interface{}) (int, map[string]interface{}, error) {
+		fmt.Printf("[METHOD] Received testMethod: %v\n", p)
+		return 200, map[string]interface{}{"result": "ok", "received": p}, nil
+	}); err != nil {
+		return fmt.Errorf("register method: %w", err)
+	}
+	fmt.Println("[METHOD] Registered 'testMethod'")
+
+	// Get initial twin state
+	desired, reported, err := c.RetrieveTwinState(ctx)
+	if err != nil {
+		fmt.Printf("[TWIN] Warning: cannot get twin state: %v\n", err)
+	} else {
+		fmt.Printf("[TWIN] Desired: %v\n", desired)
+		fmt.Printf("[TWIN] Reported: %v\n", reported)
+	}
+
+	fmt.Println()
+	fmt.Println("=== Running (Ctrl+C to stop) ===")
+
+	// Goroutine for C2D events
+	go func() {
+		for msg := range evSub.C() {
+			fmt.Printf("[C2D] Received: Payload=%s, Properties=%v, MessageID=%s\n",
+				string(msg.Payload), msg.Properties, msg.MessageID)
+		}
+		if err := evSub.Err(); err != nil {
+			fmt.Printf("[C2D] Error: %v\n", err)
+		}
+	}()
+
+	// Goroutine for twin updates
+	go func() {
+		for twin := range twinSub.C() {
+			b, _ := json.Marshal(twin)
+			fmt.Printf("[TWIN] Update: %s\n", string(b))
+		}
+		if err := twinSub.Err(); err != nil {
+			fmt.Printf("[TWIN] Error: %v\n", err)
+		}
+	}()
+
+	// Periodic D2C sending
+	if sendIntervalFlag > 0 {
+		go func() {
+			ticker := time.NewTicker(time.Duration(sendIntervalFlag) * time.Second)
+			defer ticker.Stop()
+			count := 0
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					count++
+					payload := fmt.Sprintf(`{"msg":"test","count":%d,"time":"%s"}`, count, time.Now().Format(time.RFC3339))
+					if err := c.SendEvent(ctx, []byte(payload),
+						iotdevice.WithSendContentType("application/json"),
+						iotdevice.WithSendContentEncoding("utf-8"),
+					); err != nil {
+						fmt.Printf("[D2C] Send error: %v\n", err)
+					} else {
+						fmt.Printf("[D2C] Sent: %s\n", payload)
+					}
+				}
+			}
+		}()
+	}
+
+	// Block forever
+	<-ctx.Done()
 	return nil
 }
 
