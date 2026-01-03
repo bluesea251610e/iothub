@@ -98,6 +98,16 @@ func WithTokenLifetime(lifetime time.Duration) TransportOption {
 	}
 }
 
+// WithTokenRefreshBuffer sets how long before token expiry to proactively reconnect.
+// Default is 10 minutes. Set to 0 to disable proactive refresh.
+// Example: if token lifetime is 1 hour and buffer is 10 minutes, client will
+// reconnect after 50 minutes to get a new token, avoiding EdgeHub disconnection.
+func WithTokenRefreshBuffer(buffer time.Duration) TransportOption {
+	return func(tr *Transport) {
+		tr.tokenRefreshBuffer = buffer
+	}
+}
+
 // New returns new Transport transport.
 // See more: https://docs.microsoft.com/en-us/azure/iot-hub/iot-hub-mqtt-support
 func New(opts ...TransportOption) *Transport {
@@ -132,11 +142,13 @@ type Transport struct {
 	logger logger.Logger
 	cocfg  func(opts *mqtt.ClientOptions)
 
-	webSocket         bool
-	connStatusHandler ConnectionStatusHandler // connection status callback
-	retryInterval     time.Duration           // reconnect interval (default: 30s)
-	keepAlive         time.Duration           // keep alive interval (default: 60s)
-	tokenLifetime     time.Duration           // SAS token lifetime (default: 1h)
+	webSocket          bool
+	connStatusHandler  ConnectionStatusHandler // connection status callback
+	retryInterval      time.Duration           // reconnect interval (default: 30s)
+	keepAlive          time.Duration           // keep alive interval (default: 60s)
+	tokenLifetime      time.Duration           // SAS token lifetime (default: 1h)
+	tokenRefreshBuffer time.Duration           // refresh buffer before expiry (default: 10m)
+	tokenRefreshStop   chan struct{}           // stop signal for token refresh goroutine
 }
 
 type resp struct {
@@ -256,6 +268,8 @@ func (tr *Transport) Connect(ctx context.Context, creds transport.Credentials) e
 	o.SetKeepAlive(keepAlive)
 	o.SetOnConnectHandler(func(c mqtt.Client) {
 		tr.logger.Debugf("connection established")
+		// Restart token refresh timer on reconnection
+		tr.startTokenRefreshTimer()
 		// Invoke connection status callback
 		if tr.connStatusHandler != nil {
 			tr.connStatusHandler(true, nil)
@@ -287,7 +301,64 @@ func (tr *Transport) Connect(ctx context.Context, creds transport.Credentials) e
 
 	tr.did = creds.GetDeviceID()
 	tr.conn = c
+
+	// Start proactive token refresh timer
+	tr.startTokenRefreshTimer()
+
 	return nil
+}
+
+// startTokenRefreshTimer starts a goroutine that will trigger reconnection
+// before the token expires, avoiding EdgeHub disconnection.
+func (tr *Transport) startTokenRefreshTimer() {
+	// Get token lifetime and refresh buffer
+	tokenLifetime := tr.tokenLifetime
+	if tokenLifetime == 0 {
+		tokenLifetime = time.Hour // default 1 hour
+	}
+	refreshBuffer := tr.tokenRefreshBuffer
+	if refreshBuffer == 0 {
+		refreshBuffer = 10 * time.Minute // default 10 minutes before expiry
+	}
+
+	// Calculate when to refresh (token lifetime - buffer)
+	refreshInterval := tokenLifetime - refreshBuffer
+	if refreshInterval <= 0 {
+		tr.logger.Debugf("token refresh disabled: lifetime=%v, buffer=%v", tokenLifetime, refreshBuffer)
+		return
+	}
+
+	// Stop any existing refresh timer
+	tr.stopTokenRefreshTimer()
+
+	tr.tokenRefreshStop = make(chan struct{})
+	go func() {
+		tr.logger.Debugf("token refresh timer started: will reconnect in %v", refreshInterval)
+		select {
+		case <-time.After(refreshInterval):
+			tr.logger.Infof("proactive token refresh: reconnecting to get new token")
+			// Disconnect and let auto-reconnect kick in with new token
+			tr.mu.RLock()
+			conn := tr.conn
+			tr.mu.RUnlock()
+			if conn != nil && conn.IsConnected() {
+				conn.Disconnect(100) // 100ms to allow pending messages
+				// Note: auto-reconnect will call CredentialsProvider to get new token
+			}
+		case <-tr.tokenRefreshStop:
+			tr.logger.Debugf("token refresh timer stopped")
+		case <-tr.done:
+			tr.logger.Debugf("token refresh timer stopped: transport closed")
+		}
+	}()
+}
+
+// stopTokenRefreshTimer stops the token refresh timer if running
+func (tr *Transport) stopTokenRefreshTimer() {
+	if tr.tokenRefreshStop != nil {
+		close(tr.tokenRefreshStop)
+		tr.tokenRefreshStop = nil
+	}
 }
 
 type subFunc func() error
@@ -688,6 +759,10 @@ func contextToken(ctx context.Context, t mqtt.Token) error {
 func (tr *Transport) Close() error {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
+
+	// Stop token refresh timer
+	tr.stopTokenRefreshTimer()
+
 	select {
 	case <-tr.done:
 		return nil
