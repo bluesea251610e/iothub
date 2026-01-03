@@ -13,6 +13,7 @@ import (
 	"github.com/bluesea251610e/iothub/iotdevice/transport"
 	"github.com/bluesea251610e/iothub/iotservice"
 	"github.com/bluesea251610e/iothub/logger"
+	"github.com/coder/websocket"
 )
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -91,6 +92,10 @@ type Transport struct {
 	twinMu       sync.Mutex
 	twinSender   *amqp.Sender
 	twinReceiver *amqp.Receiver
+	// twinCallbacks maps correlation ID to response channel
+	twinCallbacks map[string]chan *amqp.Message
+	// twinMux handles twin updates
+	twinMux transport.TwinStateDispatcher
 
 	// Direct methods
 	methodMu       sync.Mutex
@@ -112,6 +117,9 @@ func (tr *Transport) Connect(ctx context.Context, creds transport.Credentials) e
 
 	tr.creds = creds
 
+	// Check if using X509 authentication
+	useX509 := creds.GetCertificate() != nil
+
 	// Build TLS config
 	tlsCfg := tr.tlsCfg
 	if tlsCfg == nil {
@@ -124,9 +132,16 @@ func (tr *Transport) Connect(ctx context.Context, creds transport.Credentials) e
 	}
 
 	// Build connection options
+	// When using X509, the TLS client certificate provides authentication (SASL EXTERNAL)
 	connOpts := &amqp.ConnOptions{
 		TLSConfig:  tlsCfg,
 		Properties: map[string]any{"com.microsoft:client-version": "iothub-go-amqp/dev"},
+	}
+
+	// For X509, explicitly set SASL EXTERNAL mechanism
+	// Empty string is used for TLS client certificate authentication
+	if useX509 {
+		connOpts.SASLType = amqp.SASLTypeExternal("")
 	}
 
 	var conn *amqp.Conn
@@ -158,12 +173,19 @@ func (tr *Transport) Connect(ctx context.Context, creds transport.Credentials) e
 	}
 	tr.sess = sess
 
-	// Start CBS authentication
-	if err := tr.startCBSAuth(ctx); err != nil {
-		sess.Close(context.Background())
-		conn.Close()
-		tr.notifyConnectionStatus(false, err)
-		return err
+	// Authentication based on credential type
+	if useX509 {
+		// X509 authentication - TLS client cert already authenticated via SASL EXTERNAL
+		// No CBS authentication needed
+		tr.logDebug("Using X509 authentication (SASL EXTERNAL via TLS client cert)")
+	} else {
+		// SAS authentication - use CBS (Claims-Based Security)
+		if err := tr.startCBSAuth(ctx); err != nil {
+			sess.Close(context.Background())
+			conn.Close()
+			tr.notifyConnectionStatus(false, err)
+			return err
+		}
 	}
 
 	tr.notifyConnectionStatus(true, nil)
@@ -174,8 +196,34 @@ func (tr *Transport) dialWebSocket(ctx context.Context, host string, opts *amqp.
 	// AMQP over WebSocket URL format for Azure IoT Hub
 	wsURL := fmt.Sprintf("wss://%s:443/$iothub/websocket", host)
 
-	// Use amqp.Dial with WebSocket URL - go-amqp supports wss:// scheme
-	return amqp.Dial(ctx, wsURL, opts)
+	// WebSocket dial options
+	wsOpts := &websocket.DialOptions{
+		Subprotocols: []string{"amqp"},
+	}
+
+	// Use TLS config from AMQP options if provided
+	if opts != nil && opts.TLSConfig != nil {
+		wsOpts.HTTPClient = nil // Will use default with TLS
+	}
+
+	// Dial WebSocket connection
+	wsConn, _, err := websocket.Dial(ctx, wsURL, wsOpts)
+	if err != nil {
+		return nil, fmt.Errorf("websocket dial failed: %w", err)
+	}
+
+	// Wrap WebSocket as net.Conn using NetConn
+	// NetConn requires a context and message type
+	netConn := websocket.NetConn(ctx, wsConn, websocket.MessageBinary)
+
+	// Create AMQP connection over the WebSocket net.Conn
+	conn, err := amqp.NewConn(ctx, netConn, opts)
+	if err != nil {
+		wsConn.Close(websocket.StatusNormalClosure, "amqp connection failed")
+		return nil, fmt.Errorf("amqp connection over websocket failed: %w", err)
+	}
+
+	return conn, nil
 }
 
 func (tr *Transport) notifyConnectionStatus(connected bool, err error) {
@@ -193,6 +241,12 @@ func (tr *Transport) logDebug(format string, args ...interface{}) {
 func (tr *Transport) logError(format string, args ...interface{}) {
 	if tr.logger != nil {
 		tr.logger.Errorf(format, args...)
+	}
+}
+
+func (tr *Transport) logWarn(format string, args ...interface{}) {
+	if tr.logger != nil {
+		tr.logger.Warnf(format, args...)
 	}
 }
 
@@ -350,17 +404,49 @@ func (tr *Transport) RegisterDirectMethods(ctx context.Context, mux transport.Me
 		return errors.New("already registered for direct methods")
 	}
 
-	// Subscribe to method requests
-	// Address format: /devices/{deviceId}/methods/deviceBound
-	methodAddr := fmt.Sprintf("/devices/%s/methods/deviceBound", tr.creds.GetDeviceID())
-	receiver, err := tr.sess.NewReceiver(ctx, methodAddr, nil)
+	// Azure IoT Hub AMQP Methods link address format:
+	// amqps://{host}/devices/{deviceId}/methods/deviceBound
+	// Reference: azure-iot-sdk-c/iothub_client/src/iothubtransport_amqp_messenger.c
+	deviceID := tr.creds.GetDeviceID()
+	hostName := tr.creds.GetHostName()
+	moduleID := tr.creds.GetModuleID()
+
+	var methodAddr string
+	if moduleID != "" {
+		methodAddr = fmt.Sprintf("amqps://%s/devices/%s/modules/%s/methods/deviceBound", hostName, deviceID, moduleID)
+	} else {
+		methodAddr = fmt.Sprintf("amqps://%s/devices/%s/methods/deviceBound", hostName, deviceID)
+	}
+
+	// Link attach properties required by Azure IoT Hub for Methods
+	// Correlation ID for methods is the DeviceID (or DeviceID/ModuleID)
+	correlationID := deviceID
+	if moduleID != "" {
+		correlationID = fmt.Sprintf("%s/%s", deviceID, moduleID)
+	}
+
+	linkProps := map[string]any{
+		"com.microsoft:api-version":            "2019-10-01",
+		"com.microsoft:channel-correlation-id": correlationID,
+	}
+
+	// Receiver Link (Requests): Source is Address, Target is "requests"
+	receiverOpts := &amqp.ReceiverOptions{
+		Properties:    linkProps,
+		TargetAddress: "requests",
+	}
+	receiver, err := tr.sess.NewReceiver(ctx, methodAddr, receiverOpts)
 	if err != nil {
 		return err
 	}
 	tr.methodReceiver = receiver
 
-	// Create sender for method responses (same address)
-	sender, err := tr.sess.NewSender(ctx, methodAddr, nil)
+	// Sender Link (Responses): Target is Address, Source is "responses"
+	senderOpts := &amqp.SenderOptions{
+		Properties:    linkProps,
+		SourceAddress: "responses",
+	}
+	sender, err := tr.sess.NewSender(ctx, methodAddr, senderOpts)
 	if err != nil {
 		receiver.Close(ctx)
 		return err
@@ -404,8 +490,11 @@ func (tr *Transport) handleMethods(ctx context.Context, mux transport.MethodDisp
 		// Send response
 		respMsg := &amqp.Message{
 			Data: [][]byte{respBody},
+			Properties: &amqp.MessageProperties{
+				CorrelationID: msg.Properties.CorrelationID,
+			},
 			ApplicationProperties: map[string]any{
-				"IoThub-status": rc,
+				"IoThub-status": int32(rc),
 			},
 		}
 
