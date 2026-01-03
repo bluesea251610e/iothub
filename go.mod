@@ -4,6 +4,7 @@ go 1.23.9
 
 require (
 	github.com/Azure/go-amqp v1.5.0
+	github.com/coder/websocket v1.8.14
 	github.com/eclipse/paho.mqtt.golang v1.5.0
 )
 
