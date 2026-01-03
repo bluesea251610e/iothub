@@ -116,10 +116,10 @@ See `-help` for more details.
 
 ### iotdevice
 
-1. Device modules support.
-2. HTTP transport (files uploading).
-3. AMQP transport (batch sending, WS).
-
-## Contributing
+1. [X] Device modules support.
+2. [ ] HTTP transport (files uploading).
+3. [X] AMQP transport (batch sending, WS).
+4. [X] Full AMQP Twin & Direct Method support.
+5. [X] MQTT Proactive Token Refresh.
 
 All contributions are welcome.
